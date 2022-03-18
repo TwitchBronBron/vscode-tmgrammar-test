@@ -3,6 +3,23 @@ import * as tm from 'vscode-textmate';
 import * as oniguruma from 'vscode-oniguruma';
 import { GrammarTestCase, TestFailure } from './model';
 import { parseGrammarTestCase } from './parsing';
+import { EOL } from 'os';
+import chalk from 'chalk';
+import { Padding, TestFailed, TestSuccessful, toMap } from '../common';
+
+const symbols = {
+  ok: '✓',
+  err: '✖',
+  dot: '․',
+  comma: ',',
+  bang: '!'
+};
+
+if (process.platform === 'win32') {
+  symbols.ok = '\u221A';
+  symbols.err = '\u00D7';
+  symbols.dot = '.';
+}
 
 export { parseGrammarTestCase, GrammarTestCase, TestFailure, missingScopes_ };
 
@@ -17,7 +34,7 @@ export async function runGrammarTestCase(
         throw new Error(`Could not load scope ${testCase.metadata.scope}`);
       }
 
-      const assertions = toMap((x) => x.sourceLineNumber, testCase.assertions);
+      const assertions = toMap((x) => x.sourceLineNumber.toString(), testCase.assertions);
 
       let ruleStack: tm.StackElement = <any>null;
 
@@ -87,13 +104,13 @@ export function createRegistryFromGrammars(
     grammarIndex[rawGrammar.scopeName] = rawGrammar;
   }
 
-  const wasmPath =  require.resolve('vscode-oniguruma').replace(/main\.js$/, 'onig.wasm')
+  const wasmPath = require.resolve('vscode-oniguruma').replace(/main\.js$/, 'onig.wasm')
   const wasmBin = fs.readFileSync(wasmPath).buffer;
   const vscodeOnigurumaLib = oniguruma.loadWASM(wasmBin).then(() => {
-      return {
-          createOnigScanner(patterns: any) { return new oniguruma.OnigScanner(patterns); },
-          createOnigString(s: any) { return new oniguruma.OnigString(s); }
-      };
+    return {
+      createOnigScanner(patterns: any) { return new oniguruma.OnigScanner(patterns); },
+      createOnigString(s: any) { return new oniguruma.OnigString(s); }
+    };
   });
 
   return new tm.Registry(<tm.RegistryOptions>{
@@ -138,9 +155,144 @@ function missingScopes_(rs: string[], as: string[]): string[] {
   return j === rs.length ? [] : rs.slice(j);
 }
 
-function toMap<T>(f: (x: T) => number, xs: T[]): { [key: number]: T } {
-  return xs.reduce((m: { [key: number]: T }, x: T) => {
-    m[f(x)] = x;
-    return m;
-  }, {});
+
+
+
+function printSourceLine(testCase: GrammarTestCase, failure: TestFailure, terminalWidth: number) {
+  const line = testCase.source[failure.srcLine];
+  const pos = failure.line + 1 + ': ';
+  const accents =
+    ' '.repeat(failure.start) + '^'.repeat(failure.end - failure.start);
+
+  const termWidth = terminalWidth - pos.length - Padding.length - 5;
+
+  const trimLeft = failure.end > termWidth ? Math.max(0, failure.start - 8) : 0;
+
+  const line1 = line.substr(trimLeft);
+  const accents1 = accents.substr(trimLeft);
+
+  console.log(Padding + chalk.gray(pos) + line1.substr(0, termWidth));
+  console.log(Padding + ' '.repeat(pos.length) + accents1.substr(0, termWidth));
 }
+
+function printReason(testCase: GrammarTestCase, failure: TestFailure) {
+  if (failure.missing && failure.missing.length > 0) {
+    console.log(
+      chalk.red(Padding + 'missing required scopes: ') +
+      chalk.gray(failure.missing.join(' '))
+    );
+  }
+  if (failure.unexpected && failure.unexpected.length > 0) {
+    console.log(
+      chalk.red(Padding + 'prohibited scopes: ') +
+      chalk.gray(failure.unexpected.join(' '))
+    );
+  }
+  if (failure.actual !== undefined) {
+    console.log(
+      chalk.red(Padding + 'actual: ') + chalk.gray(failure.actual.join(' '))
+    );
+  }
+}
+
+export function displayTestResultFull(
+  filename: string,
+  testCase: GrammarTestCase,
+  failures: TestFailure[],
+  terminalWidth: number
+): number {
+  if (failures.length === 0) {
+    console.log(
+      chalk.green(symbols.ok) +
+      ' ' +
+      chalk.whiteBright(filename) +
+      ` run successfuly.`
+    );
+    return TestSuccessful;
+  } else {
+    console.log(chalk.red(symbols.err + ' ' + filename + ' failed'));
+    failures.forEach((failure) => {
+      const { l, s, e } = getCorrectedOffsets(failure);
+      console.log(
+        Padding +
+        'at [' +
+        chalk.whiteBright(`${filename}:${l}:${s}:${e}`) +
+        ']:'
+      );
+      printSourceLine(testCase, failure, terminalWidth);
+      printReason(testCase, failure);
+
+      console.log(EOL);
+    });
+    console.log('');
+    return TestFailed;
+  }
+}
+
+function renderCompactErrorMsg(
+  testCase: GrammarTestCase,
+  failure: TestFailure
+): string {
+  let res = '';
+  if (failure.missing && failure.missing.length > 0) {
+    res += `Missing required scopes: [ ${failure.missing.join(' ')} ] `;
+  }
+  if (failure.unexpected && failure.unexpected.length > 0) {
+    res += `Prohibited scopes: [ ${failure.unexpected.join(' ')} ] `;
+  }
+  if (failure.actual !== undefined) {
+    res += `actual scopes: [${failure.actual.join(' ')}]`;
+  }
+  return res;
+}
+
+export function displayTestResultCompact(
+  filename: string,
+  testCase: GrammarTestCase,
+  failures: TestFailure[]
+): number {
+  if (failures.length === 0) {
+    console.log(
+      chalk.green(symbols.ok) +
+      ' ' +
+      chalk.whiteBright(filename) +
+      ` run successfuly.`
+    );
+    return TestSuccessful;
+  } else {
+    failures.forEach((failure) => {
+      console.log(
+        `ERROR ${filename}:${failure.line + 1}:${failure.start + 1}:${failure.end + 1
+        } ${renderCompactErrorMsg(testCase, failure)}`
+      );
+    });
+    return TestFailed;
+  }
+}
+
+export function handleGrammarTestError(
+  filename: string,
+  testCase: GrammarTestCase,
+  reason: any
+): number {
+  console.log(
+    chalk.red(symbols.err) +
+    ' testcase ' +
+    chalk.gray(filename) +
+    ' aborted due to an error'
+  );
+  console.log(reason);
+  return TestFailed;
+}
+
+
+function getCorrectedOffsets(
+  failure: TestFailure
+): { l: number; s: number; e: number } {
+  return {
+    l: failure.line + 1,
+    s: failure.start + 1,
+    e: failure.end + 1
+  };
+}
+
